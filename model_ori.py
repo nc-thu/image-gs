@@ -47,6 +47,7 @@ class GaussianSplatting2D(nn.Module):
         self.evaluate = args.eval
         set_random_seed(seed=args.seed)
         self.device = args.device
+        # self.dtype = torch.float32
         self.dtype = torch.float32
         self._init_logging(args)
         self._init_target(args)
@@ -414,34 +415,7 @@ class GaussianSplatting2D(nn.Module):
             # Optimization
             begin = perf_counter()
             self._get_total_loss(images)
-            
-            # 🔥 调试信息：只在第1步和第2步打印
-            if self.step <= 2:
-                print("\n" + "#"*70)
-                print(f"[Step {self.step}] 准备调用 backward()")
-                print(f"  total_loss: {self.total_loss.item():.6f}")
-                print(f"  total_loss.requires_grad: {self.total_loss.requires_grad}")
-                print(f"  total_loss.device: {self.total_loss.device}")
-                print("#"*70)
-            
             self.total_loss.backward()
-            
-            # 🔥 调试信息：检查梯度是否被计算
-            if self.step <= 2:
-                print("\n" + "#"*70)
-                print(f"[Step {self.step}] backward() 完成！检查梯度:")
-                print(f"  xy.grad 存在: {self.xy.grad is not None}")
-                if self.xy.grad is not None:
-                    print(f"    shape: {self.xy.grad.shape}, device: {self.xy.grad.device}")
-                    print(f"    mean: {self.xy.grad.mean().item():.8f}, max: {self.xy.grad.max().item():.8f}")
-                print(f"  scale.grad 存在: {self.scale.grad is not None}")
-                if self.scale.grad is not None:
-                    print(f"    shape: {self.scale.grad.shape}, device: {self.scale.grad.device}")
-                    print(f"    mean: {self.scale.grad.mean().item():.8f}")
-                print(f"  rot.grad 存在: {self.rot.grad is not None}")
-                print(f"  feat.grad 存在: {self.feat.grad is not None}")
-                print("#"*70 + "\n")
-            
             self.optimizer.step()
             self.total_time_accum += (perf_counter() - begin + render_time)
             # Logging
@@ -470,17 +444,19 @@ class GaussianSplatting2D(nn.Module):
 
     def _get_total_loss(self, images):
         self.total_loss = 0
-        if self.l1_loss_ratio > 1e7:#我们不采用L1 LOSS
+        if self.l1_loss_ratio > 1e-7:
             self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, self.gt_images)
             self.total_loss += self.l1_loss
         else:
             self.l1_loss = None
-        if self.l2_loss_ratio > 1e7:#我们不采用L2 LOSS
+        # if self.l2_loss_ratio > 1e-7:
+        if self.l2_loss_ratio > 1e7:
             self.l2_loss = self.l2_loss_ratio * F.mse_loss(images, self.gt_images)
             self.total_loss += self.l2_loss
         else:
             self.l2_loss = None
         if self.ssim_loss_ratio > 1e-7:
+        # if self.ssim_loss_ratio > 1e7:
             self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.gt_images.unsqueeze(0)))
             self.total_loss += self.ssim_loss
         else:
