@@ -164,12 +164,12 @@ class _RasterizeGaussiansSum(Function):
 
     @staticmethod
     def backward(ctx, v_out_img):
-        print("\n" + "="*70)
-        print("🔥🔥🔥 [Rasterize CUDA Backward] 被调用了！")
-        print(f"  v_out_img shape: {v_out_img.shape}")
-        print(f"  v_out_img device: {v_out_img.device}")
-        print(f"  v_out_img dtype: {v_out_img.dtype}")
-        print("="*70)
+        # print("\n" + "="*70)
+        # print("🔥🔥🔥 [Rasterize CUDA Backward] 被调用了！")
+        # print(f"  v_out_img shape: {v_out_img.shape}")
+        # print(f"  v_out_img device: {v_out_img.device}")
+        # print(f"  v_out_img dtype: {v_out_img.dtype}")
+        # print("="*70)
         
         img_height = ctx.img_height
         img_width = ctx.img_width
@@ -194,7 +194,7 @@ class _RasterizeGaussiansSum(Function):
             # if colors.shape[-1] == 3:
             #     rasterize_fn = _C.rasterize_backward
             # else:
-            print("  📌 调用 _C.nd_rasterize_backward (CUDA kernel)...")
+            # print("  📌 调用 _C.nd_rasterize_backward (CUDA kernel)...")
             rasterize_fn = _C.nd_rasterize_backward
             v_xy, v_conic, v_colors = rasterize_fn(
                 img_height,
@@ -208,11 +208,11 @@ class _RasterizeGaussiansSum(Function):
                 colors,
                 v_out_img
             )
-            print(f"  ✅ CUDA backward完成！")
-            print(f"     v_xy shape: {v_xy.shape if v_xy is not None else None}")
-            print(f"     v_conic shape: {v_conic.shape if v_conic is not None else None}")
-            print(f"     v_colors shape: {v_colors.shape if v_colors is not None else None}")
-            print("="*70 + "\n")
+            # print(f"  ✅ CUDA backward完成！")
+            # print(f"     v_xy shape: {v_xy.shape if v_xy is not None else None}")
+            # print(f"     v_conic shape: {v_conic.shape if v_conic is not None else None}")
+            # print(f"     v_colors shape: {v_colors.shape if v_colors is not None else None}")
+            # print("="*70 + "\n")
         else:
             (
                 gaussian_ids_sorted,

@@ -75,11 +75,11 @@ class _ProjectGaussians2dScaleRot(Function):
 
     @staticmethod
     def backward(ctx, v_xys, v_radii, v_conics, v_num_tiles_hit):
-        print("\n" + "="*70)
-        print("🔥🔥🔥 [Project CUDA Backward] 被调用了！")
-        print(f"  v_xys shape: {v_xys.shape if v_xys is not None else None}")
-        print(f"  v_conics shape: {v_conics.shape if v_conics is not None else None}")
-        print("="*70)
+        # print("\n" + "="*70)
+        # print("🔥🔥🔥 [Project CUDA Backward] 被调用了！")
+        # print(f"  v_xys shape: {v_xys.shape if v_xys is not None else None}")
+        # print(f"  v_conics shape: {v_conics.shape if v_conics is not None else None}")
+        # print("="*70)
         
         (
             means2d,
@@ -88,7 +88,7 @@ class _ProjectGaussians2dScaleRot(Function):
             radii,
             conics,
         ) = ctx.saved_tensors
-        print("  📌 调用 _C.project_gaussians_2d_scale_rot_backward (CUDA kernel)...")
+        # print("  📌 调用 _C.project_gaussians_2d_scale_rot_backward (CUDA kernel)...")
         (v_cov2d, v_mean2d, v_scale, v_rot) = _C.project_gaussians_2d_scale_rot_backward(
             ctx.num_points,
             means2d,
@@ -101,11 +101,11 @@ class _ProjectGaussians2dScaleRot(Function):
             v_xys,
             v_conics,
         )
-        print(f"  ✅ Project backward完成！")
-        print(f"     v_mean2d shape: {v_mean2d.shape if v_mean2d is not None else None}")
-        print(f"     v_scale shape: {v_scale.shape if v_scale is not None else None}")
-        print(f"     v_rot shape: {v_rot.shape if v_rot is not None else None}")
-        print("="*70 + "\n")
+        # print(f"  ✅ Project backward完成！")
+        # print(f"     v_mean2d shape: {v_mean2d.shape if v_mean2d is not None else None}")
+        # print(f"     v_scale shape: {v_scale.shape if v_scale is not None else None}")
+        # print(f"     v_rot shape: {v_rot.shape if v_rot is not None else None}")
+        # print("="*70 + "\n")
         
 
         # Return a gradient for each input.
