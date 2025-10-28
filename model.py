@@ -359,23 +359,33 @@ class GaussianSplatting2D(nn.Module):
     def forward(self, img_h, img_w, tile_bounds, upsample_ratio=None, benchmark=False):
         scale = self._get_scale(upsample_ratio=upsample_ratio)
         xy, rot, feat = self.xy, self.rot, self.feat
+        
         if self.quantize:
             xy, scale, rot, feat = ste_quantize(xy, self.pos_bits), ste_quantize(
                 scale, self.scale_bits), ste_quantize(rot, self.rot_bits), ste_quantize(feat, self.feat_bits)
+        
         begin = perf_counter()
+        
+        # 如果使用手动反向传播，需要detach并保存原始值
+        if self.use_manual_backward and not benchmark:
+            xy_input_for_cache = xy.detach().clone()
+            scale_for_cache = scale.detach().clone()
+            rot_for_cache = rot.detach().clone()
+            feat_for_cache = feat.detach().clone()
+        
         tmp = project_gaussians_2d_scale_rot(xy, scale, rot, img_h, img_w, tile_bounds)
         xy_proj, radii, conics, num_tiles_hit = tmp
         
         # 缓存中间变量用于手动反向传播
         if self.use_manual_backward and not benchmark:
             self._forward_cache = {
-                'xy_input': xy.detach(),
-                'scale': scale.detach(),
-                'rot': rot.detach(),
-                'feat': feat.detach(),
-                'xy_proj': xy_proj.detach(),
-                'radii': radii.detach(),
-                'conics': conics.detach(),
+                'xy_input': xy_input_for_cache,
+                'scale': scale_for_cache,
+                'rot': rot_for_cache,
+                'feat': feat_for_cache,
+                'xy_proj': xy_proj.detach().clone(),
+                'radii': radii.detach().clone(),
+                'conics': conics.detach().clone(),
             }
         
         if not self.disable_tiles:
@@ -426,8 +436,9 @@ class GaussianSplatting2D(nn.Module):
         self.lpips_final, self.flip_final, self.msssim_final = 1.0, 1.0, 0.0
 
         self.step = 0
-        with torch.no_grad():
-            self._log_images(log_final=False, plot_gaussians=self.vis_gaussians)
+        # 跳过第一次_log_images以加快启动（调试时可注释掉）
+        # with torch.no_grad():
+        #     self._log_images(log_final=False, plot_gaussians=self.vis_gaussians)
         for step in range(self.start_step, self.max_steps+1):
             self.step = step
             self.optimizer.zero_grad()
@@ -499,46 +510,20 @@ class GaussianSplatting2D(nn.Module):
         return self.psnr_curr, self.ssim_curr
 
     def _get_total_loss(self, images):
-        self.total_loss = 0
-        if self.l1_loss_ratio > 1e7:#我们不采用L1 LOSS
-            self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, self.gt_images)
-            self.total_loss += self.l1_loss
-        else:
-            self.l1_loss = None
-        if self.l2_loss_ratio > 1e7:#我们不采用L2 LOSS
-            self.l2_loss = self.l2_loss_ratio * F.mse_loss(images, self.gt_images)
-            self.total_loss += self.l2_loss
-        else:
-            self.l2_loss = None
-        if self.ssim_loss_ratio > 1e-7:
-            self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.gt_images.unsqueeze(0)))
-            self.total_loss += self.ssim_loss
-        else:
-            self.ssim_loss = None
+        """只使用SSIM损失，简化实现"""
+        # 只使用SSIM损失
+        self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.gt_images.unsqueeze(0)))
+        self.total_loss = self.ssim_loss
     
     def _manual_backward(self, images):
         """
-        手动实现反向传播，不使用PyTorch的autograd
+        手动实现反向传播，只使用SSIM损失
         """
         print("  🔥 [Manual Backward] 开始手动反向传播...")
         
-        # 1. 计算损失对图像的梯度
-        grad_images = torch.zeros_like(images)
-        
-        if self.ssim_loss is not None and self.ssim_loss_ratio > 1e-7:
-            # SSIM梯度
-            grad_ssim = ssim_loss_backward(images, self.gt_images, self.ssim_loss)
-            grad_images += self.ssim_loss_ratio * grad_ssim
-        
-        if self.l1_loss is not None:
-            # L1梯度
-            grad_l1 = torch.sign(images - self.gt_images)
-            grad_images += self.l1_loss_ratio * grad_l1
-        
-        if self.l2_loss is not None:
-            # L2梯度
-            grad_l2 = 2.0 * (images - self.gt_images)
-            grad_images += self.l2_loss_ratio * grad_l2
+        # 1. 计算SSIM损失对图像的梯度
+        grad_ssim = ssim_loss_backward(images, self.gt_images, self.ssim_loss)
+        grad_images = self.ssim_loss_ratio * grad_ssim
         
         print(f"    梯度图像 shape: {grad_images.shape}, mean: {grad_images.mean().item():.8f}")
         
@@ -603,10 +588,7 @@ class GaussianSplatting2D(nn.Module):
         ssim = fused_ssim(images.unsqueeze(0), gt_images.unsqueeze(0)).item()
         if log:
             self.psnr_curr, self.ssim_curr = psnr, ssim
-            loss_results = f"Loss: {self.total_loss.item():.4f}"
-            loss_results += f", L1: {self.l1_loss.item():.4f}" if self.l1_loss is not None else ""
-            loss_results += f", L2: {self.l2_loss.item():.4f}" if self.l2_loss is not None else ""
-            loss_results += f", SSIM: {self.ssim_loss.item():.4f}" if self.ssim_loss is not None else ""
+            loss_results = f"Loss: {self.total_loss.item():.4f} (SSIM: {self.ssim_loss.item():.4f})"
             time_results = f"Total: {self.total_time_accum:.2f} s | Render: {self.render_time_accum:.2f} s"
             self.worklog.info(f"Step: {self.step:d} | {time_results} | {loss_results} | PSNR: {self.psnr_curr:.2f} | SSIM: {self.ssim_curr:.4f}")
         return psnr, ssim
