@@ -493,24 +493,23 @@ class GaussianSplatting2D(nn.Module):
         # 1. 计算损失对图像的梯度
         grad_images = torch.zeros_like(images)
         
-        if self.ssim_loss is not None:
-            # SSIM损失的梯度
-            grad_ssim = ssim_loss_backward(images, self.gt_images, self.ssim_loss)
-            grad_images += self.ssim_loss_ratio * grad_ssim
-        
+        # L1损失的梯度
         if self.l1_loss is not None:
-            # L1损失的梯度
             grad_l1 = torch.sign(images - self.gt_images)
             grad_images += self.l1_loss_ratio * grad_l1
         
+        # L2损失的梯度
         if self.l2_loss is not None:
-            # L2损失的梯度
             grad_l2 = 2.0 * (images - self.gt_images)
             grad_images += self.l2_loss_ratio * grad_l2
         
-        # 数值稳定性：替换NaN/Inf并按像素数归一，避免梯度过大导致不收敛
+        # SSIM损失的梯度
+        if self.ssim_loss is not None:
+            grad_ssim = ssim_loss_backward(images, self.gt_images, self.ssim_loss)
+            grad_images += self.ssim_loss_ratio * grad_ssim
+        
+        # 轻微的数值稳定性处理（但不过度归一化）
         grad_images = torch.nan_to_num(grad_images, nan=0.0, posinf=0.0, neginf=0.0)
-        grad_images = grad_images / float(max(1, self.img_h * self.img_w))
 
         # 2. 从图像梯度反向传播到光栅化参数
         # grad_images已经是[C, H, W]格式，直接使用
@@ -524,16 +523,15 @@ class GaussianSplatting2D(nn.Module):
         v_xy, v_scale, v_rot = project_backward_scale_rot(
             xy, scale, rot, v_xy_proj, v_conic, self.img_h, self.img_w
         )
-
-        # 数值稳定性：裁剪梯度，避免异常大步长导致SSIM上升
-        def _safe_clip(t, clip_val=5.0):
-            t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
-            return torch.clamp(t, min=-clip_val, max=clip_val)
-
-        v_xy = _safe_clip(v_xy)
-        v_scale = _safe_clip(v_scale)
-        v_rot = _safe_clip(v_rot)
-        v_feat = _safe_clip(v_feat)
+        
+        # 基本数值稳定性：仅替换NaN/Inf，保持梯度的自然量级
+        def _safe_nan_to_num(t):
+            return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        v_xy = _safe_nan_to_num(v_xy)
+        v_scale = _safe_nan_to_num(v_scale)
+        v_rot = _safe_nan_to_num(v_rot)
+        v_feat = _safe_nan_to_num(v_feat)
         
         # 4. 处理量化的梯度（如果启用）
         if self.quantize:
@@ -570,13 +568,29 @@ class GaussianSplatting2D(nn.Module):
         return images, render_time
 
     def _get_total_loss(self, images):
-        # 仅使用SSIM LOSS，简化训练目标
+        # 恢复L1+SSIM混合损失，与原始model_ori.py保持一致
         self.total_loss = 0
-        self.l1_loss = None
-        self.l2_loss = None
-        # SSIM loss（最小化 1 - SSIM）
-        self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.gt_images.unsqueeze(0)))
-        self.total_loss += self.ssim_loss
+        
+        # L1 Loss (主要损失)
+        if self.l1_loss_ratio > 1e-7:
+            self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, self.gt_images)
+            self.total_loss += self.l1_loss
+        else:
+            self.l1_loss = None
+            
+        # L2 Loss (通常关闭)
+        if self.l2_loss_ratio > 1e-7:
+            self.l2_loss = self.l2_loss_ratio * F.mse_loss(images, self.gt_images)
+            self.total_loss += self.l2_loss
+        else:
+            self.l2_loss = None
+            
+        # SSIM Loss (辅助损失)
+        if self.ssim_loss_ratio > 1e-7:
+            self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.gt_images.unsqueeze(0)))
+            self.total_loss += self.ssim_loss
+        else:
+            self.ssim_loss = None
 
     def _evaluate(self, log=True, upsample=False):
         if upsample:  # Do not log performance metrics for upsampled images
