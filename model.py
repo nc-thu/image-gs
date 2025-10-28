@@ -359,41 +359,31 @@ class GaussianSplatting2D(nn.Module):
     def forward(self, img_h, img_w, tile_bounds, upsample_ratio=None, benchmark=False):
         scale = self._get_scale(upsample_ratio=upsample_ratio)
         xy, rot, feat = self.xy, self.rot, self.feat
-        
         if self.quantize:
             xy, scale, rot, feat = ste_quantize(xy, self.pos_bits), ste_quantize(
                 scale, self.scale_bits), ste_quantize(rot, self.rot_bits), ste_quantize(feat, self.feat_bits)
-        
         begin = perf_counter()
-        
-        # 如果使用手动反向传播，需要detach并保存原始值
-        if self.use_manual_backward and not benchmark:
-            xy_input_for_cache = xy.detach().clone()
-            scale_for_cache = scale.detach().clone()
-            rot_for_cache = rot.detach().clone()
-            feat_for_cache = feat.detach().clone()
-        
         tmp = project_gaussians_2d_scale_rot(xy, scale, rot, img_h, img_w, tile_bounds)
-        xy_proj, radii, conics, num_tiles_hit = tmp
+        xy, radii, conics, num_tiles_hit = tmp
         
         # 缓存中间变量用于手动反向传播
         if self.use_manual_backward and not benchmark:
             self._forward_cache = {
-                'xy_input': xy_input_for_cache,
-                'scale': scale_for_cache,
-                'rot': rot_for_cache,
-                'feat': feat_for_cache,
-                'xy_proj': xy_proj.detach().clone(),
+                'xy_input': self.xy.detach().clone(),
+                'scale': self._get_scale(upsample_ratio=upsample_ratio).detach().clone(),
+                'rot': self.rot.detach().clone(),
+                'feat': self.feat.detach().clone(),
+                'xy_proj': xy.detach().clone(),
                 'radii': radii.detach().clone(),
                 'conics': conics.detach().clone(),
             }
         
         if not self.disable_tiles:
             enable_topk_norm = not self.disable_topk_norm
-            tmp = xy_proj, radii, conics, num_tiles_hit, feat, img_h, img_w, self.block_h, self.block_w, enable_topk_norm
+            tmp = xy, radii, conics, num_tiles_hit, feat, img_h, img_w, self.block_h, self.block_w, enable_topk_norm
             out_image = rasterize_gaussians_sum(*tmp)
         else:
-            tmp = xy_proj, conics, feat, img_h, img_w
+            tmp = xy, conics, feat, img_h, img_w
             out_image = rasterize_gaussians_no_tiles(*tmp)
         render_time = perf_counter() - begin
         if benchmark:
