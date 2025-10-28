@@ -538,29 +538,34 @@ class GaussianSplatting2D(nn.Module):
             # STE: 量化函数的梯度直接传递
             pass
         
-        # 5. 设置梯度到参数
+        # 5. 设置梯度到参数 (注意：不要重新初始化，因为optimizer.zero_grad()已经处理)
         if self.xy.grad is None:
-            self.xy.grad = torch.zeros_like(self.xy)
-        if self.scale.grad is None:
-            self.scale.grad = torch.zeros_like(self.scale)
-        if self.rot.grad is None:
-            self.rot.grad = torch.zeros_like(self.rot)
+            self.xy.grad = v_xy.clone()
+        else:
+            self.xy.grad.add_(v_xy)  # 累积梯度
+            
         if self.feat.grad is None:
-            self.feat.grad = torch.zeros_like(self.feat)
-        
-        # 累积梯度
-        self.xy.grad += v_xy
-        self.feat.grad += v_feat
+            self.feat.grad = v_feat.clone()
+        else:
+            self.feat.grad.add_(v_feat)
         
         # 对于scale，需要处理inverse_scale
         if not self.disable_inverse_scale:
             # 如果使用了inverse scale，需要应用链式法则
             # d/d(scale) = d/d(1/scale) * d(1/scale)/d(scale) = v_scale * (-1/scale^2)
-            self.scale.grad += v_scale * (-1.0 / (self.scale ** 2))
+            v_scale_final = v_scale * (-1.0 / (self.scale ** 2))
         else:
-            self.scale.grad += v_scale
+            v_scale_final = v_scale
+            
+        if self.scale.grad is None:
+            self.scale.grad = v_scale_final.clone()
+        else:
+            self.scale.grad.add_(v_scale_final)
         
-        self.rot.grad += v_rot
+        if self.rot.grad is None:
+            self.rot.grad = v_rot.clone()
+        else:
+            self.rot.grad.add_(v_rot)
         
         if self.step <= 2:  # 只在前两步打印详细信息
             print("  ✅ [Manual Backward] 手动反向传播完成！")

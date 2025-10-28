@@ -153,21 +153,26 @@ def rasterize_backward_tile_based(
                 valid = (sigma >= 0) & torch.isfinite(sigma)
                 weight = torch.where(valid, torch.exp(-sigma), torch.zeros_like(sigma))
                 
-                # ===== 反向传播计算 =====
+                # ===== 正确的反向传播计算 =====
+                # 前向: pixel[c] = Σ(color[i,c] * exp(-sigma[i]))
                 
-                # 1. 颜色梯度: v_color += weight * grad_output
+                # 1. 颜色梯度: ∂L/∂color[i,c] = ∂L/∂pixel[c] * exp(-sigma[i])
                 # weight: [n, tile_h, tile_w], tile_grad: [C, tile_h, tile_w]
-                # 需要: [n, C]
+                # 广播: weight[n,1,h,w] * tile_grad[1,C,h,w] = [n,C,h,w]
                 weighted_grad = weight.unsqueeze(1) * tile_grad.unsqueeze(0)  # [n, C, tile_h, tile_w]
                 v_color_batch = weighted_grad.sum(dim=(2, 3))  # [n, C]
                 v_color.index_add_(0, intersect_indices, v_color_batch)
                 
-                # 2. sigma梯度: v_sigma = -weight * (color · grad_output)
-                color_dot_grad = (g_color.unsqueeze(-1).unsqueeze(-1) * tile_grad.unsqueeze(0)).sum(dim=1)
-                # color_dot_grad: [n, tile_h, tile_w]
-                v_sigma = -weight * color_dot_grad
+                # 2. sigma梯度: ∂L/∂sigma[i] = -Σ_c(∂L/∂pixel[c] * color[i,c] * exp(-sigma[i]))
+                #    = -exp(-sigma[i]) * Σ_c(∂L/∂pixel[c] * color[i,c])
+                # 计算 Σ_c(∂L/∂pixel[c] * color[i,c])
+                color_grad_dot = (g_color.unsqueeze(-1).unsqueeze(-1) * tile_grad.unsqueeze(0)).sum(dim=1)
+                # color_grad_dot: [n, tile_h, tile_w]
+                v_sigma = -weight * color_grad_dot  # 乘以 -exp(-sigma)
                 
-                # 3. conic梯度
+                # 3. conic梯度: ∂L/∂conic = ∂L/∂sigma * ∂sigma/∂conic
+                # sigma = 0.5*(a*dx² + c*dy²) + b*dx*dy
+                # ∂sigma/∂a = 0.5*dx², ∂sigma/∂b = dx*dy, ∂sigma/∂c = 0.5*dy²
                 dx2 = dx * dx
                 dy2 = dy * dy
                 dxdy = dx * dy
@@ -178,7 +183,8 @@ def rasterize_backward_tile_based(
                 v_conic_batch = torch.stack([v_conic_a, v_conic_b, v_conic_c], dim=-1)
                 v_conic.index_add_(0, intersect_indices, v_conic_batch)
                 
-                # 4. 位置梯度
+                # 4. 位置梯度: ∂L/∂xy = ∂L/∂sigma * ∂sigma/∂xy
+                # ∂sigma/∂x = a*dx + b*dy, ∂sigma/∂y = b*dx + c*dy
                 a_flat = a.view(n_intersect, 1, 1)  # [n, 1, 1]
                 b_flat = b.view(n_intersect, 1, 1)  # [n, 1, 1]
                 c_flat = c.view(n_intersect, 1, 1)  # [n, 1, 1]
