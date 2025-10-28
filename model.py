@@ -472,7 +472,8 @@ class GaussianSplatting2D(nn.Module):
         
         # 光栅化（调用CUDA前向传播）
         if not self.disable_tiles:
-            enable_topk_norm = not self.disable_topk_norm
+            # 手写反向不支持topk归一化，这里强制关闭以保证梯度匹配
+            enable_topk_norm = False
             tmp = xy_proj, radii, conics, num_tiles_hit, feat, self.img_h, self.img_w, self.block_h, self.block_w, enable_topk_norm
             out_image = rasterize_gaussians_sum(*tmp)
         else:
@@ -507,18 +508,32 @@ class GaussianSplatting2D(nn.Module):
             grad_l2 = 2.0 * (images - self.gt_images)
             grad_images += self.l2_loss_ratio * grad_l2
         
+        # 数值稳定性：替换NaN/Inf并按像素数归一，避免梯度过大导致不收敛
+        grad_images = torch.nan_to_num(grad_images, nan=0.0, posinf=0.0, neginf=0.0)
+        grad_images = grad_images / float(max(1, self.img_h * self.img_w))
+
         # 2. 从图像梯度反向传播到光栅化参数
         # grad_images已经是[C, H, W]格式，直接使用
         
-        # 调用手写的tile-based反向传播
+        # 调用手写的tile-based反向传播（使用更大的tile加速：256）
         v_xy_proj, v_conic, v_feat = rasterize_backward_tile_based(
-            xy_proj, conics, feat, radii, grad_images
+            xy_proj, conics, feat, radii, grad_images, tile_size=256
         )
         
         # 3. 从投影参数反向传播到原始参数
         v_xy, v_scale, v_rot = project_backward_scale_rot(
             xy, scale, rot, v_xy_proj, v_conic, self.img_h, self.img_w
         )
+
+        # 数值稳定性：裁剪梯度，避免异常大步长导致SSIM上升
+        def _safe_clip(t, clip_val=5.0):
+            t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+            return torch.clamp(t, min=-clip_val, max=clip_val)
+
+        v_xy = _safe_clip(v_xy)
+        v_scale = _safe_clip(v_scale)
+        v_rot = _safe_clip(v_rot)
+        v_feat = _safe_clip(v_feat)
         
         # 4. 处理量化的梯度（如果启用）
         if self.quantize:
@@ -555,22 +570,13 @@ class GaussianSplatting2D(nn.Module):
         return images, render_time
 
     def _get_total_loss(self, images):
+        # 仅使用SSIM LOSS，简化训练目标
         self.total_loss = 0
-        if self.l1_loss_ratio > 1e7:#我们不采用L1 LOSS
-            self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, self.gt_images)
-            self.total_loss += self.l1_loss
-        else:
-            self.l1_loss = None
-        if self.l2_loss_ratio > 1e7:#我们不采用L2 LOSS
-            self.l2_loss = self.l2_loss_ratio * F.mse_loss(images, self.gt_images)
-            self.total_loss += self.l2_loss
-        else:
-            self.l2_loss = None
-        if self.ssim_loss_ratio > 1e-7:
-            self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.gt_images.unsqueeze(0)))
-            self.total_loss += self.ssim_loss
-        else:
-            self.ssim_loss = None
+        self.l1_loss = None
+        self.l2_loss = None
+        # SSIM loss（最小化 1 - SSIM）
+        self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.gt_images.unsqueeze(0)))
+        self.total_loss += self.ssim_loss
 
     def _evaluate(self, log=True, upsample=False):
         if upsample:  # Do not log performance metrics for upsampled images
