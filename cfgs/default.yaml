@@ -42,6 +42,7 @@ l2_loss_ratio:         0.0
 ssim_loss_ratio:       0.1
 # Optimization
 disable_tiles:         False # Disable tile-based rendering (warning: optimization and rendering without tiles will be way slower)
+use_manual_backward:   False # Use manual backward propagation instead of PyTorch autograd
 max_steps:             10000 # Maximum number of optimization steps
 pos_lr:                5.0e-4
 scale_lr:              2.0e-3

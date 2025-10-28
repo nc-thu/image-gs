@@ -19,6 +19,11 @@ from gsplat import (
     rasterize_gaussians_no_tiles,
     rasterize_gaussians_sum,
 )
+from manual_backward_efficient import (
+    rasterize_backward_tile_based,
+    project_backward_scale_rot,
+    ssim_loss_backward,
+)
 from utils.flip import LDRFLIPLoss
 from utils.image_utils import (
     compute_image_gradients,
@@ -200,6 +205,7 @@ class GaussianSplatting2D(nn.Module):
 
     def _init_optimization(self, args):
         self.disable_tiles = args.disable_tiles
+        self.use_manual_backward = getattr(args, 'use_manual_backward', False)  # 新增：是否使用手动反向传播
         self.start_step = 1
         self.max_steps = args.max_steps
         self.pos_lr = args.pos_lr
@@ -216,6 +222,10 @@ class GaussianSplatting2D(nn.Module):
             self.check_decay_steps = args.check_decay_steps
             self.max_decay_times = args.max_decay_times
             self.decay_threshold = args.decay_threshold
+        
+        if self.use_manual_backward:
+            self.worklog.info("🔥 使用手动反向传播（Manual Backward）")
+            self.worklog.info("***********************************************")
 
     def _init_pos_scale_feat(self, args):
         self.init_mode = args.init_mode
@@ -354,13 +364,26 @@ class GaussianSplatting2D(nn.Module):
                 scale, self.scale_bits), ste_quantize(rot, self.rot_bits), ste_quantize(feat, self.feat_bits)
         begin = perf_counter()
         tmp = project_gaussians_2d_scale_rot(xy, scale, rot, img_h, img_w, tile_bounds)
-        xy, radii, conics, num_tiles_hit = tmp
+        xy_proj, radii, conics, num_tiles_hit = tmp
+        
+        # 缓存中间变量用于手动反向传播
+        if self.use_manual_backward and not benchmark:
+            self._forward_cache = {
+                'xy_input': xy.detach(),
+                'scale': scale.detach(),
+                'rot': rot.detach(),
+                'feat': feat.detach(),
+                'xy_proj': xy_proj.detach(),
+                'radii': radii.detach(),
+                'conics': conics.detach(),
+            }
+        
         if not self.disable_tiles:
             enable_topk_norm = not self.disable_topk_norm
-            tmp = xy, radii, conics, num_tiles_hit, feat, img_h, img_w, self.block_h, self.block_w, enable_topk_norm
+            tmp = xy_proj, radii, conics, num_tiles_hit, feat, img_h, img_w, self.block_h, self.block_w, enable_topk_norm
             out_image = rasterize_gaussians_sum(*tmp)
         else:
-            tmp = xy, conics, feat, img_h, img_w
+            tmp = xy_proj, conics, feat, img_h, img_w
             out_image = rasterize_gaussians_no_tiles(*tmp)
         render_time = perf_counter() - begin
         if benchmark:
@@ -422,9 +445,16 @@ class GaussianSplatting2D(nn.Module):
                 print(f"  total_loss: {self.total_loss.item():.6f}")
                 print(f"  total_loss.requires_grad: {self.total_loss.requires_grad}")
                 print(f"  total_loss.device: {self.total_loss.device}")
+                print(f"  使用手动反向传播: {self.use_manual_backward}")
                 print("#"*70)
             
-            self.total_loss.backward()
+            # ===== 反向传播 =====
+            if self.use_manual_backward:
+                # 手动反向传播
+                self._manual_backward(images)
+            else:
+                # PyTorch自动求导
+                self.total_loss.backward()
             
             # 🔥 调试信息：检查梯度是否被计算
             if self.step <= 2:
@@ -485,6 +515,84 @@ class GaussianSplatting2D(nn.Module):
             self.total_loss += self.ssim_loss
         else:
             self.ssim_loss = None
+    
+    def _manual_backward(self, images):
+        """
+        手动实现反向传播，不使用PyTorch的autograd
+        """
+        print("  🔥 [Manual Backward] 开始手动反向传播...")
+        
+        # 1. 计算损失对图像的梯度
+        grad_images = torch.zeros_like(images)
+        
+        if self.ssim_loss is not None and self.ssim_loss_ratio > 1e-7:
+            # SSIM梯度
+            grad_ssim = ssim_loss_backward(images, self.gt_images, self.ssim_loss)
+            grad_images += self.ssim_loss_ratio * grad_ssim
+        
+        if self.l1_loss is not None:
+            # L1梯度
+            grad_l1 = torch.sign(images - self.gt_images)
+            grad_images += self.l1_loss_ratio * grad_l1
+        
+        if self.l2_loss is not None:
+            # L2梯度
+            grad_l2 = 2.0 * (images - self.gt_images)
+            grad_images += self.l2_loss_ratio * grad_l2
+        
+        print(f"    梯度图像 shape: {grad_images.shape}, mean: {grad_images.mean().item():.8f}")
+        
+        # 2. 从渲染反向传播到高斯参数
+        # 需要保存前向传播的中间变量
+        if not hasattr(self, '_forward_cache'):
+            raise RuntimeError("需要在forward中缓存中间变量！")
+        
+        xy_proj = self._forward_cache['xy_proj']
+        radii = self._forward_cache['radii']
+        conics = self._forward_cache['conics']
+        feat = self._forward_cache['feat']
+        scale = self._forward_cache['scale']
+        rot = self._forward_cache['rot']
+        xy_input = self._forward_cache['xy_input']
+        
+        # 3. Rasterize的反向传播
+        print("    调用 rasterize_backward_tile_based...")
+        v_xy_proj, v_conics, v_feat = rasterize_backward_tile_based(
+            xys=xy_proj,
+            conics=conics,
+            colors=feat,
+            radii=radii,
+            grad_output=grad_images,
+            tile_size=self.block_h
+        )
+        
+        print(f"    v_xy_proj: {v_xy_proj.shape}, mean: {v_xy_proj.mean().item():.8f}")
+        print(f"    v_conics: {v_conics.shape}, mean: {v_conics.mean().item():.8f}")
+        print(f"    v_feat: {v_feat.shape}, mean: {v_feat.mean().item():.8f}")
+        
+        # 4. Project的反向传播
+        print("    调用 project_backward_scale_rot...")
+        v_xy_input, v_scale, v_rot = project_backward_scale_rot(
+            means2d=xy_input,
+            scales2d=scale,
+            rotation=rot,
+            grad_xy=v_xy_proj,
+            grad_conic=v_conics,
+            img_height=self.img_h,
+            img_width=self.img_w
+        )
+        
+        print(f"    v_xy_input: {v_xy_input.shape}, mean: {v_xy_input.mean().item():.8f}")
+        print(f"    v_scale: {v_scale.shape}, mean: {v_scale.mean().item():.8f}")
+        print(f"    v_rot: {v_rot.shape}, mean: {v_rot.mean().item():.8f}")
+        
+        # 5. 将梯度赋值给参数
+        self.xy.grad = v_xy_input if self.xy.grad is None else self.xy.grad + v_xy_input
+        self.scale.grad = v_scale if self.scale.grad is None else self.scale.grad + v_scale
+        self.rot.grad = v_rot if self.rot.grad is None else self.rot.grad + v_rot
+        self.feat.grad = v_feat if self.feat.grad is None else self.feat.grad + v_feat
+        
+        print("  ✅ [Manual Backward] 手动反向传播完成！\n")
 
     def _evaluate(self, log=True, upsample=False):
         if upsample:  # Do not log performance metrics for upsampled images
