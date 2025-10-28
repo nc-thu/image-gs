@@ -11,17 +11,34 @@ from typing import Tuple
 
 
 def _cov2d_to_conic_vjp(conic: Tensor, v_conic: Tensor) -> Tensor:
-    """计算从conic到cov2d的梯度"""
-    a, b, c = conic.unbind(dim=-1)
-    va, vb, vc = v_conic.unbind(dim=-1)
+    """
+    计算从conic到cov2d的梯度
+    对应CUDA: v_Sigma = -X * G * X
+    其中X是conic矩阵，G是v_conic梯度矩阵
+    """
+    # conic: [N, 3] (a, b, c) 表示 [[a, b], [b, c]]
+    # v_conic: [N, 3] 对应的梯度
+    
+    a, b, c = conic.unbind(dim=-1)  # [N]
+    va, vb, vc = v_conic.unbind(dim=-1)  # [N]
+    
+    # 构建矩阵 X = [[a, b], [b, c]]  (conic matrix)
+    # 构建矩阵 G = [[va, vb], [vb, vc]]  (gradient matrix)
+    
+    # 计算 -X * G * X
+    # X * G = [[a*va + b*vb, a*vb + b*vc], [b*va + c*vb, b*vb + c*vc]]
     xg00 = a * va + b * vb
     xg01 = a * vb + b * vc
     xg10 = b * va + c * vb
     xg11 = b * vb + c * vc
+    
+    # (X * G) * X = 最终结果的负值
     v_sigma00 = -(xg00 * a + xg01 * b)
     v_sigma01 = -(xg00 * b + xg01 * c)
     v_sigma10 = -(xg10 * a + xg11 * b)
     v_sigma11 = -(xg10 * b + xg11 * c)
+    
+    # 返回上三角形式: [sigma00, sigma01+sigma10, sigma11]
     return torch.stack(
         [v_sigma00, v_sigma01 + v_sigma10, v_sigma11], dim=-1
     )
@@ -201,6 +218,7 @@ def project_backward_scale_rot(
     means2d: Tensor,
     scales2d: Tensor,
     rotation: Tensor,
+    conics: Tensor,  # 添加conics参数
     grad_xy: Tensor,
     grad_conic: Tensor,
     img_height: int,
@@ -208,14 +226,21 @@ def project_backward_scale_rot(
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
     投影的反向传播：从xy和conic梯度计算到means2d、scales2d、rotation的梯度
+    完全对应CUDA backward2d.cu的实现
     """
     theta = rotation.view(-1)
-    v_cov2d = _cov2d_to_conic_vjp(conic=grad_conic, v_conic=grad_conic)
+    
+    # 1. 从conic梯度计算到cov2d梯度 (对应cov2d_to_conic_vjp)
+    # 注意：这里传入实际的conic值和对应的梯度
+    v_cov2d = _cov2d_to_conic_vjp(conic=conics, v_conic=grad_conic)
 
+    # 2. 从xy梯度计算到mean2d梯度 (对应CUDA: v_mean2d[idx].x = v_xy[idx].x * (0.5f * img_size.x))
     v_mean = torch.zeros_like(means2d)
-    v_mean[:, 0] = grad_xy[:, 0] * img_width
-    v_mean[:, 1] = grad_xy[:, 1] * img_height
+    v_mean[:, 0] = grad_xy[:, 0] * (0.5 * img_width)   # 关键：包含0.5系数！
+    v_mean[:, 1] = grad_xy[:, 1] * (0.5 * img_height)  # 关键：包含0.5系数！
 
+    # 3. 从cov2d梯度计算到scale和rotation梯度
+    # 对应CUDA backward2d.cu的矩阵运算
     R = _rotmat(theta).to(dtype=scales2d.dtype)
     Rg = _rotmat_grad(theta).to(dtype=scales2d.dtype)
 
@@ -226,21 +251,24 @@ def project_backward_scale_rot(
     M = torch.matmul(R, S)
     Mt = M.transpose(-1, -2)
 
+    # scale梯度计算
     scale_x_g = torch.zeros_like(S)
     scale_y_g = torch.zeros_like(S)
-    scale_x_g[:, 0, 0] = 2.0 * scales2d[:, 0]
-    scale_y_g[:, 1, 1] = 2.0 * scales2d[:, 1]
+    scale_x_g[:, 0, 0] = 2.0 * scales2d[:, 0]  # 对应CUDA: 2.f * scales2d[idx].x
+    scale_y_g[:, 1, 1] = 2.0 * scales2d[:, 1]  # 对应CUDA: 2.f * scales2d[idx].y
 
     sigma_x_g = torch.matmul(torch.matmul(R, scale_x_g), R.transpose(-1, -2))
     sigma_y_g = torch.matmul(torch.matmul(R, scale_y_g), R.transpose(-1, -2))
 
+    # rotation梯度计算
     theta_g = torch.matmul(torch.matmul(Rg, S), Mt) + torch.matmul(M, torch.matmul(S, Rg.transpose(-1, -2)))
 
-    G11 = v_cov2d[:, 0]
-    G12 = v_cov2d[:, 1]
-    G22 = v_cov2d[:, 2]
+    G11 = v_cov2d[:, 0]  # dL/dSigma_11
+    G12 = v_cov2d[:, 1]  # dL/dSigma_12
+    G22 = v_cov2d[:, 2]  # dL/dSigma_22
 
     v_scale = torch.zeros_like(scales2d)
+    # 对应CUDA: v_scale[idx].x = G_11 * sigma_x_g[0][0] + 2 * G_12 * sigma_x_g[0][1] + G_22 * sigma_x_g[1][1]
     v_scale[:, 0] = (
         G11 * sigma_x_g[:, 0, 0]
         + 2.0 * G12 * sigma_x_g[:, 0, 1]
@@ -252,6 +280,7 @@ def project_backward_scale_rot(
         + G22 * sigma_y_g[:, 1, 1]
     )
 
+    # 对应CUDA: v_rot[idx] = G_11 * theta_g[0][0] + 2 * G_12 * theta_g[0][1] + G_22 * theta_g[1][1]
     v_rot = (
         G11 * theta_g[:, 0, 0]
         + 2.0 * G12 * theta_g[:, 0, 1]

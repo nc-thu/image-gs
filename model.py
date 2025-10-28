@@ -490,25 +490,15 @@ class GaussianSplatting2D(nn.Module):
         if self.step <= 2:  # 只在前两步打印详细信息
             print("  🔥 [Manual Backward] 开始手动反向传播...")
         
-        # 1. 计算损失对图像的梯度
+        # 1. 计算损失对图像的梯度（纯SSIM）
         grad_images = torch.zeros_like(images)
         
-        # L1损失的梯度
-        if self.l1_loss is not None:
-            grad_l1 = torch.sign(images - self.gt_images)
-            grad_images += self.l1_loss_ratio * grad_l1
-        
-        # L2损失的梯度
-        if self.l2_loss is not None:
-            grad_l2 = 2.0 * (images - self.gt_images)
-            grad_images += self.l2_loss_ratio * grad_l2
-        
-        # SSIM损失的梯度
+        # 仅SSIM损失的梯度
         if self.ssim_loss is not None:
             grad_ssim = ssim_loss_backward(images, self.gt_images, self.ssim_loss)
             grad_images += self.ssim_loss_ratio * grad_ssim
         
-        # 轻微的数值稳定性处理（但不过度归一化）
+        # 基本数值稳定性：仅替换NaN/Inf
         grad_images = torch.nan_to_num(grad_images, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 2. 从图像梯度反向传播到光栅化参数
@@ -521,7 +511,7 @@ class GaussianSplatting2D(nn.Module):
         
         # 3. 从投影参数反向传播到原始参数
         v_xy, v_scale, v_rot = project_backward_scale_rot(
-            xy, scale, rot, v_xy_proj, v_conic, self.img_h, self.img_w
+            xy, scale, rot, conics, v_xy_proj, v_conic, self.img_h, self.img_w
         )
         
         # 基本数值稳定性：仅替换NaN/Inf，保持梯度的自然量级
@@ -573,24 +563,12 @@ class GaussianSplatting2D(nn.Module):
         return images, render_time
 
     def _get_total_loss(self, images):
-        # 恢复L1+SSIM混合损失，与原始model_ori.py保持一致
+        # 纯SSIM LOSS，简化验证
         self.total_loss = 0
+        self.l1_loss = None
+        self.l2_loss = None
         
-        # L1 Loss (主要损失)
-        if self.l1_loss_ratio > 1e-7:
-            self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, self.gt_images)
-            self.total_loss += self.l1_loss
-        else:
-            self.l1_loss = None
-            
-        # L2 Loss (通常关闭)
-        if self.l2_loss_ratio > 1e-7:
-            self.l2_loss = self.l2_loss_ratio * F.mse_loss(images, self.gt_images)
-            self.total_loss += self.l2_loss
-        else:
-            self.l2_loss = None
-            
-        # SSIM Loss (辅助损失)
+        # 仅SSIM Loss
         if self.ssim_loss_ratio > 1e-7:
             self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.gt_images.unsqueeze(0)))
             self.total_loss += self.ssim_loss
