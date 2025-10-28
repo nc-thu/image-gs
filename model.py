@@ -19,6 +19,12 @@ from gsplat import (
     rasterize_gaussians_no_tiles,
     rasterize_gaussians_sum,
 )
+# 导入手写反向传播模块
+from manual_backward_efficient import (
+    rasterize_backward_tile_based,
+    project_backward_scale_rot,
+    ssim_loss_backward,
+)
 from utils.flip import LDRFLIPLoss
 from utils.image_utils import (
     compute_image_gradients,
@@ -408,13 +414,11 @@ class GaussianSplatting2D(nn.Module):
         for step in range(self.start_step, self.max_steps+1):
             self.step = step
             self.optimizer.zero_grad()
-            # Rendering
-            images, render_time = self.forward(self.img_h, self.img_w, self.tile_bounds)
-            self.render_time_accum += render_time
-            # Optimization
+            # 手写前向传播和反向传播
             begin = perf_counter()
-            self._get_total_loss(images)
-            self.total_loss.backward()
+            images, render_time = self._manual_forward_backward()
+            self.render_time_accum += render_time
+            # 优化器更新
             self.optimizer.step()
             self.total_time_accum += (perf_counter() - begin + render_time)
             # Logging
@@ -440,6 +444,115 @@ class GaussianSplatting2D(nn.Module):
         self.worklog.info(f"Mean scale: {self._get_scale().mean().item():.4f} (pixel) | {self.scale.mean().item():.4f} (raw)")
         self.worklog.info("***********************************************")
         return self.psnr_curr, self.ssim_curr
+
+    def _manual_forward_backward(self):
+        """
+        手写的前向传播和反向传播实现
+        """
+        # ===== 前向传播 =====
+        if self.step <= 2:  # 只在前两步打印详细信息
+            self.worklog.info("🔥 使用手动反向传播（Manual Backward）")
+        
+        # 获取当前参数
+        scale = self._get_scale()
+        xy, rot, feat = self.xy, self.rot, self.feat
+        
+        # 量化（如果启用）
+        if self.quantize:
+            from utils.quantization_utils import ste_quantize
+            xy = ste_quantize(xy, self.pos_bits)
+            scale = ste_quantize(scale, self.scale_bits)
+            rot = ste_quantize(rot, self.rot_bits)
+            feat = ste_quantize(feat, self.feat_bits)
+        
+        # 投影到2D
+        render_begin = perf_counter()
+        tmp = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, self.tile_bounds)
+        xy_proj, radii, conics, num_tiles_hit = tmp
+        
+        # 光栅化（调用CUDA前向传播）
+        if not self.disable_tiles:
+            enable_topk_norm = not self.disable_topk_norm
+            tmp = xy_proj, radii, conics, num_tiles_hit, feat, self.img_h, self.img_w, self.block_h, self.block_w, enable_topk_norm
+            out_image = rasterize_gaussians_sum(*tmp)
+        else:
+            tmp = xy_proj, conics, feat, self.img_h, self.img_w
+            out_image = rasterize_gaussians_no_tiles(*tmp)
+        
+        render_time = perf_counter() - render_begin
+        images = out_image.view(-1, self.img_h, self.img_w, self.feat_dim).permute(0, 3, 1, 2).contiguous().squeeze(dim=0)
+        
+        # ===== 计算损失 =====
+        self._get_total_loss(images)
+        
+        # ===== 手写反向传播 =====
+        if self.step <= 2:  # 只在前两步打印详细信息
+            print("  🔥 [Manual Backward] 开始手动反向传播...")
+        
+        # 1. 计算损失对图像的梯度
+        grad_images = torch.zeros_like(images)
+        
+        if self.ssim_loss is not None:
+            # SSIM损失的梯度
+            grad_ssim = ssim_loss_backward(images, self.gt_images, self.ssim_loss)
+            grad_images += self.ssim_loss_ratio * grad_ssim
+        
+        if self.l1_loss is not None:
+            # L1损失的梯度
+            grad_l1 = torch.sign(images - self.gt_images)
+            grad_images += self.l1_loss_ratio * grad_l1
+        
+        if self.l2_loss is not None:
+            # L2损失的梯度
+            grad_l2 = 2.0 * (images - self.gt_images)
+            grad_images += self.l2_loss_ratio * grad_l2
+        
+        # 2. 从图像梯度反向传播到光栅化参数
+        # grad_images已经是[C, H, W]格式，直接使用
+        
+        # 调用手写的tile-based反向传播
+        v_xy_proj, v_conic, v_feat = rasterize_backward_tile_based(
+            xy_proj, conics, feat, radii, grad_images
+        )
+        
+        # 3. 从投影参数反向传播到原始参数
+        v_xy, v_scale, v_rot = project_backward_scale_rot(
+            xy, scale, rot, v_xy_proj, v_conic, self.img_h, self.img_w
+        )
+        
+        # 4. 处理量化的梯度（如果启用）
+        if self.quantize:
+            # STE: 量化函数的梯度直接传递
+            pass
+        
+        # 5. 设置梯度到参数
+        if self.xy.grad is None:
+            self.xy.grad = torch.zeros_like(self.xy)
+        if self.scale.grad is None:
+            self.scale.grad = torch.zeros_like(self.scale)
+        if self.rot.grad is None:
+            self.rot.grad = torch.zeros_like(self.rot)
+        if self.feat.grad is None:
+            self.feat.grad = torch.zeros_like(self.feat)
+        
+        # 累积梯度
+        self.xy.grad += v_xy
+        self.feat.grad += v_feat
+        
+        # 对于scale，需要处理inverse_scale
+        if not self.disable_inverse_scale:
+            # 如果使用了inverse scale，需要应用链式法则
+            # d/d(scale) = d/d(1/scale) * d(1/scale)/d(scale) = v_scale * (-1/scale^2)
+            self.scale.grad += v_scale * (-1.0 / (self.scale ** 2))
+        else:
+            self.scale.grad += v_scale
+        
+        self.rot.grad += v_rot
+        
+        if self.step <= 2:  # 只在前两步打印详细信息
+            print("  ✅ [Manual Backward] 手动反向传播完成！")
+        
+        return images, render_time
 
     def _get_total_loss(self, images):
         self.total_loss = 0

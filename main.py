@@ -2,7 +2,7 @@ import argparse
 
 import torch
 
-from model_ori import GaussianSplatting2D
+from model import GaussianSplatting2D
 from utils.misc_utils import load_cfg
 
 

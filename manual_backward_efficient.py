@@ -84,7 +84,7 @@ def rasterize_backward_tile_based(
     tile_w = (img_w + tile_size - 1) // tile_size
     
     # 为每个tile分配高斯
-    print(f"  [Manual Backward] Processing {tile_h}x{tile_w} tiles...")
+    # print(f"  [Manual Backward] Processing {tile_h}x{tile_w} tiles...")  # 注释掉减少输出
     
     # 批处理高斯以节省内存
     batch_size = min(1000, num_gaussians)
@@ -179,8 +179,12 @@ def rasterize_backward_tile_based(
                 v_conic.index_add_(0, intersect_indices, v_conic_batch)
                 
                 # 4. 位置梯度
-                vx = (v_sigma * (a.squeeze(-1) * dx + b.squeeze(-1) * dy)).sum(dim=(1, 2))
-                vy = (v_sigma * (b.squeeze(-1) * dx + c.squeeze(-1) * dy)).sum(dim=(1, 2))
+                a_flat = a.view(n_intersect, 1, 1)  # [n, 1, 1]
+                b_flat = b.view(n_intersect, 1, 1)  # [n, 1, 1]
+                c_flat = c.view(n_intersect, 1, 1)  # [n, 1, 1]
+                
+                vx = (v_sigma * (a_flat * dx + b_flat * dy)).sum(dim=(1, 2))
+                vy = (v_sigma * (b_flat * dx + c_flat * dy)).sum(dim=(1, 2))
                 v_xy_batch = torch.stack([vx, vy], dim=-1)
                 v_xy.index_add_(0, intersect_indices, v_xy_batch)
     
@@ -270,4 +274,4 @@ def ssim_loss_backward(pred: Tensor, target: Tensor, loss_value: Tensor) -> Tens
         ssim_val = 1 - fused_ssim(pred_grad.unsqueeze(0), target.unsqueeze(0))
         ssim_val.backward()
     
-    return pred_grad.grad
+    return pred_grad.grad if pred_grad.grad is not None else torch.zeros_like(pred)
